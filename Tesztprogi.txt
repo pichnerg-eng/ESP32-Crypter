@@ -1,0 +1,94 @@
+#include <Arduino.h>
+#include <Encrypt.h>
+#include <Decrypt.h>
+
+Encrypt encryptor;
+Decrypt decryptor;
+
+
+void printHex(const uint8_t *data,size_t len)
+  {
+      for(size_t i = 0; i < len; i++)
+      {
+          if(data[i] < 16)
+          Serial.print("0");
+          Serial.print(data[i], HEX);
+          Serial.print(" ");
+      }
+      Serial.println();
+  }
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("===== CRYPTO LOOP TEST =====");
+    Serial.println("==============================");
+    encryptor.begin("alma123");
+    decryptor.begin("alma123");
+    //--------------------------------------------------
+    // ENCRYPT TESZT
+    //--------------------------------------------------
+    CryptoPacket packet;
+String uzenet="Titkos ESP32 uzenet ------------------------------------------------------------------------------------------------------vége";
+int msgLength=uzenet.length();
+    bool encOK =
+        encryptor.encrypt(
+            uzenet.c_str(),
+            5678,
+            2,
+            packet
+        );
+            if(!encOK)
+            {
+                Serial.println();
+                Serial.println("Encrypt error!");
+                return;
+            }
+
+    Serial.println();
+    Serial.println("===== ENCRYPT RESULT =====");
+    Serial.print("Version: "); Serial.println(packet.version);
+    Serial.print("Message ID: "); Serial.println(packet.messageID);
+    Serial.print("Raw packet length: "); Serial.println(packet.rawLength);
+    Serial.print("Message length: "); Serial.println(msgLength);
+    Serial.println();
+    Serial.println("RAW PACKET:");
+    printHex(packet.raw, packet.rawLength);
+    Serial.println();
+    Serial.println("Base64 packet:"); Serial.println(packet.base64);
+
+    //--------------------------------------------------
+    // DECRYPT TESZT
+    //--------------------------------------------------
+
+    CryptoMessage msg;
+
+    bool decOK =
+        decryptor.decryptBase64(packet.base64.c_str(),msg);
+          if(!decOK)
+          {
+              Serial.println();
+              Serial.println("Decrypt error!");
+              return;
+          }
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("===== DECRYPT RESULT =====");
+    Serial.println("==============================");
+
+    Serial.print("Version: "); Serial.println(msg.version);
+    Serial.print("Message ID: "); Serial.println(msg.messageID);
+    Serial.print("Message: "); Serial.println(msg.text);
+    Serial.println();
+    Serial.println("===== TEST COMPLETE =====");
+
+}
+
+void loop()
+{
+
+}
