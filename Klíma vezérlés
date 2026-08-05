@@ -1,0 +1,1611 @@
+/*
+  ESP32 - tobb Gree / Syen klima webes vezerlese
+  Anonimizalt, tovabbkuldheto valtozat
+
+  Funkciok:
+    - automatikus bind
+    - allapotlekerdezes
+    - webes vezerles
+    - ON/OFF
+    - uzemmod
+    - celhomerseklet
+    - ventilator
+    - teljes SwUpDn poziciovalaszto
+    - turbo
+    - kijelzo
+
+  Szükséges könyvtár:
+    ArduinoJson
+
+  Arduino IDE:
+    Board: ESP32 Dev Module
+    Serial Monitor: 115200 baud
+*/
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+#include "mbedtls/aes.h"
+#include "mbedtls/base64.h"
+
+// ======================================================
+// WIFI - TOLTSD KI
+// ======================================================
+
+const char* WIFI_SSID     = "WIFI_NEVE";
+const char* WIFI_PASSWORD = "WIFI_JELSZO";
+
+// ======================================================
+// GREE HALOZAT
+// ======================================================
+
+constexpr uint16_t GREE_PORT  = 7000;
+constexpr uint16_t LOCAL_PORT = 7000;
+
+const char GENERIC_KEY[] = "a3K8Bx%2r8Y7#xDh";
+
+WiFiUDP udp;
+WebServer server(80);
+
+// ======================================================
+// KLIMA ADATSTRUKTURA
+// ======================================================
+
+struct GreeDevice {
+  const char* name;
+  IPAddress ip;
+  String mac;
+
+  String key;
+  bool bound;
+  bool online;
+
+  bool awaitingBind;
+  bool awaitingStatus;
+
+  unsigned long lastRequest;
+  unsigned long lastResponse;
+
+  int power;
+  int mode;
+  int setTemp;
+  int fanSpeed;
+  int swing;
+  int turbo;
+  int light;
+  int quiet;
+  int health;
+  int insideTempRaw;
+};
+
+// ======================================================
+// KLIMAK - TOLTSD KI
+//
+// Uj klima hozzaadasahoz masold le egy teljes blokkot.
+// Az IP-cimet a routerbol vagy discovery sketchbol,
+// a MAC-et a visszafejtett discovery valaszbol kapod meg.
+// ======================================================
+
+GreeDevice devices[] = {
+  {
+    "Klima 1",
+    IPAddress(192, 168, 1, 101),
+    "001122334455",
+
+    "",
+    false,
+    false,
+
+    false,
+    false,
+
+    0,
+    0,
+
+    -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1
+  },
+
+  {
+    "Klima 2",
+    IPAddress(192, 168, 1, 102),
+    "AABBCCDDEEFF",
+
+    "",
+    false,
+    false,
+
+    false,
+    false,
+
+    0,
+    0,
+
+    -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1
+  }
+};
+
+constexpr int DEVICE_COUNT =
+  sizeof(devices) / sizeof(devices[0]);
+
+// ======================================================
+// IDOZITESEK
+// ======================================================
+
+unsigned long lastStatusCycle = 0;
+unsigned long lastBindCycle   = 0;
+
+constexpr unsigned long STATUS_INTERVAL_MS = 5000;
+constexpr unsigned long BIND_RETRY_MS      = 15000;
+constexpr unsigned long RESPONSE_TIMEOUT   = 4000;
+constexpr unsigned long ONLINE_TIMEOUT     = 20000;
+
+// ======================================================
+// WEBOLDAL
+// ======================================================
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0">
+
+  <title>Gree klímavezérlés</title>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 18px;
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+    }
+
+    h1 {
+      text-align: center;
+      margin-top: 4px;
+      margin-bottom: 20px;
+    }
+
+    #statusLine {
+      text-align: center;
+      margin-bottom: 16px;
+      color: #9ca3af;
+    }
+
+    .container {
+      max-width: 1000px;
+      margin: auto;
+      display: grid;
+      grid-template-columns:
+        repeat(auto-fit, minmax(310px, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      background: #1f2937;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 5px 18px rgba(0,0,0,0.35);
+    }
+
+    .card.offline {
+      opacity: 0.60;
+    }
+
+    .deviceName {
+      font-size: 22px;
+      font-weight: bold;
+      margin-bottom: 4px;
+    }
+
+    .deviceInfo {
+      color: #9ca3af;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+
+    .temperature {
+      font-size: 36px;
+      font-weight: bold;
+      margin: 12px 0;
+      text-align: center;
+    }
+
+    .roomTemp {
+      text-align: center;
+      margin-bottom: 14px;
+      color: #d1d5db;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    button, select {
+      border: 0;
+      border-radius: 10px;
+      padding: 11px 10px;
+      font-size: 15px;
+    }
+
+    button {
+      flex: 1;
+      cursor: pointer;
+      background: #374151;
+      color: white;
+    }
+
+    button:hover {
+      background: #4b5563;
+    }
+
+    button.powerOn {
+      background: #059669;
+    }
+
+    button.powerOff {
+      background: #dc2626;
+    }
+
+    button.active {
+      outline: 3px solid #60a5fa;
+    }
+
+    select {
+      width: 100%;
+      background: #374151;
+      color: white;
+    }
+
+    .label {
+      color: #9ca3af;
+      font-size: 13px;
+      margin-bottom: 5px;
+      margin-top: 12px;
+    }
+
+    .state {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+
+    .online {
+      color: #34d399;
+    }
+
+    .offlineText {
+      color: #f87171;
+    }
+
+    .note {
+      font-size: 12px;
+      color: #9ca3af;
+      line-height: 1.35;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>Gree / Syen klímavezérlés</h1>
+
+<div id="statusLine">
+  Kapcsolódás az ESP32-höz...
+</div>
+
+<div class="container" id="devices"></div>
+
+<script>
+  let lastData = null;
+
+  function modeText(mode) {
+    const modes = [
+      "AUTO",
+      "Hűtés",
+      "Párátlanítás",
+      "Ventilátor",
+      "Fűtés"
+    ];
+
+    return modes[mode] ?? "Ismeretlen";
+  }
+
+  function fanText(fan) {
+    if (fan === 0) return "AUTO";
+    return String(fan);
+  }
+
+  function sendCommand(device, key, value) {
+    fetch(
+      `/api/set?device=${device}` +
+      `&key=${encodeURIComponent(key)}` +
+      `&value=${encodeURIComponent(value)}`
+    )
+    .then(response => response.json())
+    .then(data => {
+      document.getElementById("statusLine").textContent =
+        data.message ?? "Parancs elküldve";
+
+      setTimeout(loadState, 700);
+    })
+    .catch(() => {
+      document.getElementById("statusLine").textContent =
+        "Kommunikációs hiba";
+    });
+  }
+
+  function changeTemp(device, delta) {
+    if (!lastData) return;
+
+    const current =
+      lastData.devices[device].setTemp;
+
+    const target =
+      Math.max(16, Math.min(30, current + delta));
+
+    sendCommand(device, "SetTem", target);
+  }
+
+  function swingOptions(current) {
+    const positions = [
+      [0,  "0 - Swing kikapcsolva / alap"],
+      [1,  "1 - Folyamatos teljes swing"],
+      [2,  "2 - Fix legfelső állás"],
+      [3,  "3 - Fix felső-közép állás"],
+      [4,  "4 - Fix középső állás"],
+      [5,  "5 - Fix alsó-közép állás"],
+      [6,  "6 - Fix legalsó állás"],
+      [7,  "7 - Alsó tartomány swing"],
+      [8,  "8 - Modellfüggő pozíció"],
+      [9,  "9 - Középső/alsó swing"],
+      [10, "10 - Modellfüggő pozíció"],
+      [11, "11 - Felső tartomány swing"]
+    ];
+
+    return positions
+      .map(([value, text]) =>
+        `<option value="${value}" ${
+          current === value ? "selected" : ""
+        }>${text}</option>`
+      )
+      .join("");
+  }
+
+  function renderDevice(device, index) {
+    const onlineClass =
+      device.online ? "" : "offline";
+
+    const onlineText =
+      device.online
+        ? `<span class="online">ONLINE</span>`
+        : `<span class="offlineText">OFFLINE</span>`;
+
+    const roomTemperature =
+      device.insideTemp !== null
+        ? `${device.insideTemp} °C`
+        : "--";
+
+    return `
+      <div class="card ${onlineClass}">
+
+        <div class="deviceName">
+          ${device.name}
+        </div>
+
+        <div class="deviceInfo">
+          ${device.ip} · ${onlineText}
+        </div>
+
+        <div class="row">
+          <button
+            class="powerOn ${device.power === 1 ? "active" : ""}"
+            onclick="sendCommand(${index}, 'Pow', 1)">
+            BE
+          </button>
+
+          <button
+            class="powerOff ${device.power === 0 ? "active" : ""}"
+            onclick="sendCommand(${index}, 'Pow', 0)">
+            KI
+          </button>
+        </div>
+
+        <div class="temperature">
+          ${device.setTemp >= 0 ? device.setTemp : "--"} °C
+        </div>
+
+        <div class="row">
+          <button onclick="changeTemp(${index}, -1)">−</button>
+          <button onclick="changeTemp(${index}, 1)">+</button>
+        </div>
+
+        <div class="roomTemp">
+          Beltéri hőmérséklet: ${roomTemperature}
+        </div>
+
+        <div class="label">Üzemmód</div>
+
+        <select
+          onchange="sendCommand(${index}, 'Mod', this.value)">
+
+          <option value="0"
+            ${device.mode === 0 ? "selected" : ""}>
+            AUTO
+          </option>
+
+          <option value="1"
+            ${device.mode === 1 ? "selected" : ""}>
+            Hűtés
+          </option>
+
+          <option value="2"
+            ${device.mode === 2 ? "selected" : ""}>
+            Párátlanítás
+          </option>
+
+          <option value="3"
+            ${device.mode === 3 ? "selected" : ""}>
+            Ventilátor
+          </option>
+
+          <option value="4"
+            ${device.mode === 4 ? "selected" : ""}>
+            Fűtés
+          </option>
+        </select>
+
+        <div class="label">Ventilátor</div>
+
+        <select
+          onchange="sendCommand(${index}, 'WdSpd', this.value)">
+
+          <option value="0"
+            ${device.fanSpeed === 0 ? "selected" : ""}>
+            AUTO
+          </option>
+
+          <option value="1"
+            ${device.fanSpeed === 1 ? "selected" : ""}>
+            1
+          </option>
+
+          <option value="2"
+            ${device.fanSpeed === 2 ? "selected" : ""}>
+            2
+          </option>
+
+          <option value="3"
+            ${device.fanSpeed === 3 ? "selected" : ""}>
+            3
+          </option>
+
+          <option value="4"
+            ${device.fanSpeed === 4 ? "selected" : ""}>
+            4
+          </option>
+
+          <option value="5"
+            ${device.fanSpeed === 5 ? "selected" : ""}>
+            5
+          </option>
+        </select>
+
+        <div class="label">Függőleges lamella / Swing</div>
+
+        <select
+          onchange="sendCommand(${index}, 'SwUpDn', this.value)">
+          ${swingOptions(device.swing)}
+        </select>
+
+        <div class="note">
+          A SwUpDn értékek modellenként eltérhetnek.
+          A nem támogatott állást a klíma figyelmen kívül hagyhatja,
+          vagy egy közeli támogatott pozícióra válthat.
+        </div>
+
+        <div class="row" style="margin-top:14px;">
+          <button
+            class="${device.turbo === 1 ? "active" : ""}"
+            onclick="sendCommand(
+              ${index},
+              'Tur',
+              ${device.turbo === 1 ? 0 : 1}
+            )">
+            Turbo
+          </button>
+
+          <button
+            class="${device.light === 1 ? "active" : ""}"
+            onclick="sendCommand(
+              ${index},
+              'Lig',
+              ${device.light === 1 ? 0 : 1}
+            )">
+            Kijelző
+          </button>
+        </div>
+
+        <div class="state">
+          Állapot:
+          ${device.power === 1 ? "bekapcsolva" : "kikapcsolva"},
+          ${modeText(device.mode)},
+          ventilátor: ${fanText(device.fanSpeed)},
+          SwUpDn: ${device.swing}
+        </div>
+      </div>
+    `;
+  }
+
+  function loadState() {
+    fetch("/api/state")
+      .then(response => response.json())
+      .then(data => {
+        lastData = data;
+
+        const container =
+          document.getElementById("devices");
+
+        container.innerHTML =
+          data.devices
+            .map(renderDevice)
+            .join("");
+
+        document.getElementById("statusLine").textContent =
+          `ESP32: ${data.espIp} · frissítve`;
+      })
+      .catch(() => {
+        document.getElementById("statusLine").textContent =
+          "Az ESP32 nem elérhető";
+      });
+  }
+
+  loadState();
+  setInterval(loadState, 3000);
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ======================================================
+// WIFI
+// ======================================================
+
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Kapcsolodas: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+
+    if (millis() - startTime > 30000) {
+      Serial.println();
+      Serial.println("Wi-Fi timeout.");
+      ESP.restart();
+    }
+  }
+
+  Serial.println();
+  Serial.println("Wi-Fi csatlakoztatva.");
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ======================================================
+// AES TITKOSITAS
+// ======================================================
+
+bool encryptPack(
+  const String& plaintext,
+  const String& key,
+  String& encodedOutput
+) {
+  if (key.length() != 16) {
+    return false;
+  }
+
+  size_t plainLength = plaintext.length();
+  size_t paddingLength = 16 - (plainLength % 16);
+  size_t paddedLength = plainLength + paddingLength;
+
+  uint8_t* padded = new uint8_t[paddedLength];
+  uint8_t* encrypted = new uint8_t[paddedLength];
+
+  if (!padded || !encrypted) {
+    delete[] padded;
+    delete[] encrypted;
+    return false;
+  }
+
+  memcpy(padded, plaintext.c_str(), plainLength);
+
+  for (size_t i = plainLength; i < paddedLength; i++) {
+    padded[i] = static_cast<uint8_t>(paddingLength);
+  }
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+
+  int result = mbedtls_aes_setkey_enc(
+    &aes,
+    reinterpret_cast<const unsigned char*>(key.c_str()),
+    128
+  );
+
+  if (result != 0) {
+    mbedtls_aes_free(&aes);
+    delete[] padded;
+    delete[] encrypted;
+    return false;
+  }
+
+  for (size_t offset = 0; offset < paddedLength; offset += 16) {
+    result = mbedtls_aes_crypt_ecb(
+      &aes,
+      MBEDTLS_AES_ENCRYPT,
+      padded + offset,
+      encrypted + offset
+    );
+
+    if (result != 0) {
+      mbedtls_aes_free(&aes);
+      delete[] padded;
+      delete[] encrypted;
+      return false;
+    }
+  }
+
+  mbedtls_aes_free(&aes);
+  delete[] padded;
+
+  size_t base64BufferSize =
+    4 * ((paddedLength + 2) / 3) + 8;
+
+  unsigned char* base64Buffer =
+    new unsigned char[base64BufferSize];
+
+  if (!base64Buffer) {
+    delete[] encrypted;
+    return false;
+  }
+
+  size_t base64Length = 0;
+
+  result = mbedtls_base64_encode(
+    base64Buffer,
+    base64BufferSize,
+    &base64Length,
+    encrypted,
+    paddedLength
+  );
+
+  delete[] encrypted;
+
+  if (result != 0) {
+    delete[] base64Buffer;
+    return false;
+  }
+
+  base64Buffer[base64Length] = '\0';
+  encodedOutput = reinterpret_cast<char*>(base64Buffer);
+
+  delete[] base64Buffer;
+  return true;
+}
+
+// ======================================================
+// AES VISSZAFEJTES
+// ======================================================
+
+bool decryptPack(
+  const String& encodedInput,
+  const String& key,
+  String& plaintextOutput
+) {
+  if (key.length() != 16) {
+    return false;
+  }
+
+  size_t decodedBufferSize =
+    (encodedInput.length() * 3) / 4 + 8;
+
+  uint8_t* decoded = new uint8_t[decodedBufferSize];
+
+  if (!decoded) {
+    return false;
+  }
+
+  size_t decodedLength = 0;
+
+  int result = mbedtls_base64_decode(
+    decoded,
+    decodedBufferSize,
+    &decodedLength,
+    reinterpret_cast<const unsigned char*>(encodedInput.c_str()),
+    encodedInput.length()
+  );
+
+  if (
+    result != 0 ||
+    decodedLength == 0 ||
+    decodedLength % 16 != 0
+  ) {
+    delete[] decoded;
+    return false;
+  }
+
+  uint8_t* plaintext = new uint8_t[decodedLength + 1];
+
+  if (!plaintext) {
+    delete[] decoded;
+    return false;
+  }
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+
+  result = mbedtls_aes_setkey_dec(
+    &aes,
+    reinterpret_cast<const unsigned char*>(key.c_str()),
+    128
+  );
+
+  if (result != 0) {
+    mbedtls_aes_free(&aes);
+    delete[] decoded;
+    delete[] plaintext;
+    return false;
+  }
+
+  for (size_t offset = 0; offset < decodedLength; offset += 16) {
+    result = mbedtls_aes_crypt_ecb(
+      &aes,
+      MBEDTLS_AES_DECRYPT,
+      decoded + offset,
+      plaintext + offset
+    );
+
+    if (result != 0) {
+      mbedtls_aes_free(&aes);
+      delete[] decoded;
+      delete[] plaintext;
+      return false;
+    }
+  }
+
+  mbedtls_aes_free(&aes);
+  delete[] decoded;
+
+  plaintext[decodedLength] = '\0';
+
+  int jsonEnd = -1;
+
+  for (int i = static_cast<int>(decodedLength) - 1; i >= 0; i--) {
+    if (plaintext[i] == '}') {
+      jsonEnd = i;
+      break;
+    }
+  }
+
+  if (jsonEnd < 0) {
+    delete[] plaintext;
+    return false;
+  }
+
+  plaintext[jsonEnd + 1] = '\0';
+  plaintextOutput = reinterpret_cast<char*>(plaintext);
+
+  delete[] plaintext;
+  return true;
+}
+
+// ======================================================
+// UDP KULDES
+// ======================================================
+
+bool sendUdp(
+  const IPAddress& ip,
+  const String& data
+) {
+  if (!udp.beginPacket(ip, GREE_PORT)) {
+    return false;
+  }
+
+  udp.write(
+    reinterpret_cast<const uint8_t*>(data.c_str()),
+    data.length()
+  );
+
+  return udp.endPacket();
+}
+
+// ======================================================
+// KULSO GREE CSOMAG
+// ======================================================
+
+String createOuterPacket(
+  const String& mac,
+  const String& encryptedPack,
+  int packetId
+) {
+  String packet;
+
+  packet.reserve(encryptedPack.length() + 120);
+
+  packet += "{\"cid\":\"app\",\"i\":";
+  packet += packetId;
+  packet += ",\"t\":\"pack\",\"uid\":0,\"tcid\":\"";
+  packet += mac;
+  packet += "\",\"pack\":\"";
+  packet += encryptedPack;
+  packet += "\"}";
+
+  return packet;
+}
+
+// ======================================================
+// BIND
+// ======================================================
+
+void sendBind(int index) {
+  GreeDevice& device = devices[index];
+
+  String inner =
+    "{\"mac\":\"" +
+    device.mac +
+    "\",\"t\":\"bind\",\"uid\":0}";
+
+  String encrypted;
+
+  if (!encryptPack(
+        inner,
+        String(GENERIC_KEY),
+        encrypted
+      )) {
+    return;
+  }
+
+  String outer =
+    createOuterPacket(
+      device.mac,
+      encrypted,
+      1
+    );
+
+  if (sendUdp(device.ip, outer)) {
+    device.awaitingBind = true;
+    device.lastRequest = millis();
+
+    Serial.print("Bind elkuldve: ");
+    Serial.println(device.name);
+  }
+}
+
+// ======================================================
+// STATUS LEKERES
+// ======================================================
+
+void sendStatusRequest(int index) {
+  GreeDevice& device = devices[index];
+
+  if (
+    !device.bound ||
+    device.key.length() != 16
+  ) {
+    return;
+  }
+
+  String inner =
+    "{\"cols\":["
+    "\"Pow\","
+    "\"Mod\","
+    "\"SetTem\","
+    "\"WdSpd\","
+    "\"Air\","
+    "\"Blo\","
+    "\"Health\","
+    "\"SwhSlp\","
+    "\"Lig\","
+    "\"SwingLfRig\","
+    "\"SwUpDn\","
+    "\"Quiet\","
+    "\"Tur\","
+    "\"StHt\","
+    "\"TemUn\","
+    "\"HeatCoolType\","
+    "\"TemRec\","
+    "\"SvSt\","
+    "\"TemSen\""
+    "],\"mac\":\"";
+
+  inner += device.mac;
+  inner += "\",\"t\":\"status\"}";
+
+  String encrypted;
+
+  if (!encryptPack(
+        inner,
+        device.key,
+        encrypted
+      )) {
+    return;
+  }
+
+  String outer =
+    createOuterPacket(
+      device.mac,
+      encrypted,
+      0
+    );
+
+  if (sendUdp(device.ip, outer)) {
+    device.awaitingStatus = true;
+    device.lastRequest = millis();
+  }
+}
+
+// ======================================================
+// PARANCSKULDES
+// ======================================================
+
+bool sendCommand(
+  int index,
+  const String& property,
+  int value
+) {
+  if (
+    index < 0 ||
+    index >= DEVICE_COUNT
+  ) {
+    return false;
+  }
+
+  GreeDevice& device = devices[index];
+
+  if (
+    !device.bound ||
+    device.key.length() != 16
+  ) {
+    return false;
+  }
+
+  String inner =
+    "{\"opt\":[\"" +
+    property +
+    "\"],\"p\":[" +
+    String(value) +
+    "],\"t\":\"cmd\"}";
+
+  String encrypted;
+
+  if (!encryptPack(
+        inner,
+        device.key,
+        encrypted
+      )) {
+    return false;
+  }
+
+  String outer =
+    createOuterPacket(
+      device.mac,
+      encrypted,
+      0
+    );
+
+  Serial.println();
+  Serial.print("Parancs: ");
+  Serial.print(device.name);
+  Serial.print(" / ");
+  Serial.print(property);
+  Serial.print(" = ");
+  Serial.println(value);
+
+  bool sent = sendUdp(device.ip, outer);
+
+  if (sent) {
+    delay(150);
+    sendStatusRequest(index);
+  }
+
+  return sent;
+}
+
+// ======================================================
+// SEGEDFUGGVENYEK
+// ======================================================
+
+int findDeviceByIp(
+  const IPAddress& ip
+) {
+  for (int i = 0; i < DEVICE_COUNT; i++) {
+    if (devices[i].ip == ip) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+int findStatusValue(
+  JsonArrayConst columns,
+  JsonArrayConst values,
+  const char* wantedColumn,
+  int defaultValue = -1
+) {
+  size_t count =
+    min(columns.size(), values.size());
+
+  for (size_t i = 0; i < count; i++) {
+    const char* column =
+      columns[i] | "";
+
+    if (strcmp(column, wantedColumn) == 0) {
+      return values[i].as<int>();
+    }
+  }
+
+  return defaultValue;
+}
+
+// ======================================================
+// BIND VALASZ
+// ======================================================
+
+bool processBindResponse(
+  int index,
+  JsonDocument& outer
+) {
+  GreeDevice& device = devices[index];
+
+  String encoded = outer["pack"] | "";
+
+  if (encoded.length() == 0) {
+    return false;
+  }
+
+  String decrypted;
+
+  if (!decryptPack(
+        encoded,
+        String(GENERIC_KEY),
+        decrypted
+      )) {
+    return false;
+  }
+
+  JsonDocument inner;
+
+  if (deserializeJson(inner, decrypted)) {
+    return false;
+  }
+
+  const char* type = inner["t"] | "";
+
+  if (strcasecmp(type, "bindok") != 0) {
+    return false;
+  }
+
+  String receivedKey = inner["key"] | "";
+
+  if (receivedKey.length() != 16) {
+    return false;
+  }
+
+  device.key = receivedKey;
+  device.bound = true;
+  device.online = true;
+
+  device.awaitingBind = false;
+  device.lastResponse = millis();
+
+  Serial.println();
+  Serial.print("BIND SIKERES: ");
+  Serial.println(device.name);
+
+  delay(150);
+  sendStatusRequest(index);
+
+  return true;
+}
+
+// ======================================================
+// STATUS VALASZ
+// ======================================================
+
+bool processStatusResponse(
+  int index,
+  JsonDocument& outer
+) {
+  GreeDevice& device = devices[index];
+
+  if (
+    !device.bound ||
+    device.key.length() != 16
+  ) {
+    return false;
+  }
+
+  String encoded = outer["pack"] | "";
+
+  if (encoded.length() == 0) {
+    return false;
+  }
+
+  String decrypted;
+
+  if (!decryptPack(
+        encoded,
+        device.key,
+        decrypted
+      )) {
+    return false;
+  }
+
+  JsonDocument inner;
+
+  if (deserializeJson(inner, decrypted)) {
+    return false;
+  }
+
+  const char* type = inner["t"] | "";
+
+  if (strcmp(type, "dat") != 0) {
+    return false;
+  }
+
+  JsonArrayConst columns = inner["cols"];
+  JsonArrayConst values  = inner["dat"];
+
+  if (
+    columns.isNull() ||
+    values.isNull()
+  ) {
+    return false;
+  }
+
+  device.power =
+    findStatusValue(columns, values, "Pow");
+
+  device.mode =
+    findStatusValue(columns, values, "Mod");
+
+  device.setTemp =
+    findStatusValue(columns, values, "SetTem");
+
+  device.fanSpeed =
+    findStatusValue(columns, values, "WdSpd");
+
+  device.swing =
+    findStatusValue(columns, values, "SwUpDn");
+
+  device.turbo =
+    findStatusValue(columns, values, "Tur");
+
+  device.light =
+    findStatusValue(columns, values, "Lig");
+
+  device.quiet =
+    findStatusValue(columns, values, "Quiet");
+
+  device.health =
+    findStatusValue(columns, values, "Health");
+
+  device.insideTempRaw =
+    findStatusValue(columns, values, "TemSen");
+
+  device.awaitingStatus = false;
+  device.online = true;
+  device.lastResponse = millis();
+
+  Serial.print("Status OK: ");
+  Serial.print(device.name);
+
+  Serial.print(" / Pow=");
+  Serial.print(device.power);
+
+  Serial.print(" Mod=");
+  Serial.print(device.mode);
+
+  Serial.print(" Temp=");
+  Serial.print(device.setTemp);
+
+  Serial.print(" SwUpDn=");
+  Serial.print(device.swing);
+
+  Serial.print(" Room=");
+
+  if (device.insideTempRaw >= 40) {
+    Serial.println(device.insideTempRaw - 40);
+  } else {
+    Serial.println("?");
+  }
+
+  return true;
+}
+
+// ======================================================
+// UDP VALASZOK
+// ======================================================
+
+void processUdpPackets() {
+  int packetSize = udp.parsePacket();
+
+  while (packetSize > 0) {
+    IPAddress remoteIp = udp.remoteIP();
+
+    String received;
+    received.reserve(packetSize + 1);
+
+    while (udp.available()) {
+      received += static_cast<char>(udp.read());
+    }
+
+    int index = findDeviceByIp(remoteIp);
+
+    if (index >= 0) {
+      JsonDocument outer;
+
+      if (!deserializeJson(outer, received)) {
+        bool processed = false;
+
+        if (devices[index].awaitingBind) {
+          processed =
+            processBindResponse(index, outer);
+        }
+
+        if (
+          !processed &&
+          devices[index].bound
+        ) {
+          processStatusResponse(index, outer);
+        }
+      }
+    }
+
+    packetSize = udp.parsePacket();
+  }
+}
+
+// ======================================================
+// WEB API - ALLAPOT
+// ======================================================
+
+void handleState() {
+  JsonDocument document;
+
+  document["espIp"] =
+    WiFi.localIP().toString();
+
+  JsonArray array =
+    document["devices"].to<JsonArray>();
+
+  for (int i = 0; i < DEVICE_COUNT; i++) {
+    GreeDevice& device = devices[i];
+
+    JsonObject item =
+      array.add<JsonObject>();
+
+    item["name"] = device.name;
+    item["ip"] = device.ip.toString();
+    item["mac"] = device.mac;
+    item["bound"] = device.bound;
+    item["online"] = device.online;
+    item["power"] = device.power;
+    item["mode"] = device.mode;
+    item["setTemp"] = device.setTemp;
+    item["fanSpeed"] = device.fanSpeed;
+    item["swing"] = device.swing;
+    item["turbo"] = device.turbo;
+    item["light"] = device.light;
+    item["quiet"] = device.quiet;
+    item["health"] = device.health;
+
+    if (device.insideTempRaw >= 40) {
+      item["insideTemp"] =
+        device.insideTempRaw - 40;
+    } else {
+      item["insideTemp"] = nullptr;
+    }
+  }
+
+  String response;
+  serializeJson(document, response);
+
+  server.send(
+    200,
+    "application/json",
+    response
+  );
+}
+
+// ======================================================
+// WEB API - PARANCS
+// ======================================================
+
+void handleSet() {
+  if (
+    !server.hasArg("device") ||
+    !server.hasArg("key") ||
+    !server.hasArg("value")
+  ) {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,"
+      "\"message\":\"Hianyzo parameter\"}"
+    );
+
+    return;
+  }
+
+  int index = server.arg("device").toInt();
+  String property = server.arg("key");
+  int value = server.arg("value").toInt();
+
+  bool validProperty =
+    property == "Pow" ||
+    property == "Mod" ||
+    property == "SetTem" ||
+    property == "WdSpd" ||
+    property == "SwUpDn" ||
+    property == "Tur" ||
+    property == "Lig";
+
+  if (
+    index < 0 ||
+    index >= DEVICE_COUNT ||
+    !validProperty
+  ) {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,"
+      "\"message\":\"Ervenytelen parancs\"}"
+    );
+
+    return;
+  }
+
+  if (
+    property == "SetTem" &&
+    (value < 16 || value > 30)
+  ) {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,"
+      "\"message\":\"A homerseklet 16-30 C lehet\"}"
+    );
+
+    return;
+  }
+
+  if (
+    property == "SwUpDn" &&
+    (value < 0 || value > 11)
+  ) {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,"
+      "\"message\":\"A SwUpDn ertek 0-11 lehet\"}"
+    );
+
+    return;
+  }
+
+  bool success =
+    sendCommand(index, property, value);
+
+  if (success) {
+    server.send(
+      200,
+      "application/json",
+      "{\"ok\":true,"
+      "\"message\":\"Parancs elkuldve\"}"
+    );
+  } else {
+    server.send(
+      503,
+      "application/json",
+      "{\"ok\":false,"
+      "\"message\":\"A klima nem erheto el vagy nincs bindelve\"}"
+    );
+  }
+}
+
+// ======================================================
+// WEB KISZOLGALAS
+// ======================================================
+
+void setupWebServer() {
+  server.on(
+    "/",
+    HTTP_GET,
+    []() {
+      server.send_P(
+        200,
+        "text/html; charset=utf-8",
+        INDEX_HTML
+      );
+    }
+  );
+
+  server.on(
+    "/api/state",
+    HTTP_GET,
+    handleState
+  );
+
+  server.on(
+    "/api/set",
+    HTTP_GET,
+    handleSet
+  );
+
+  server.onNotFound(
+    []() {
+      server.send(
+        404,
+        "text/plain",
+        "Not found"
+      );
+    }
+  );
+
+  server.begin();
+
+  Serial.println("Webszerver elindult.");
+}
+
+// ======================================================
+// TIMEOUTOK
+// ======================================================
+
+void handleTimeouts() {
+  for (int i = 0; i < DEVICE_COUNT; i++) {
+    GreeDevice& device = devices[i];
+
+    if (
+      device.awaitingBind &&
+      millis() - device.lastRequest >
+        RESPONSE_TIMEOUT
+    ) {
+      device.awaitingBind = false;
+    }
+
+    if (
+      device.awaitingStatus &&
+      millis() - device.lastRequest >
+        RESPONSE_TIMEOUT
+    ) {
+      device.awaitingStatus = false;
+    }
+
+    if (
+      device.lastResponse > 0 &&
+      millis() - device.lastResponse >
+        ONLINE_TIMEOUT
+    ) {
+      device.online = false;
+    }
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("ESP32 Gree webserver");
+  Serial.println("==============================");
+
+  connectWiFi();
+
+  if (!udp.begin(LOCAL_PORT)) {
+    Serial.println(
+      "UDP 7000 inditasa sikertelen."
+    );
+
+    delay(2000);
+    ESP.restart();
+  }
+
+  setupWebServer();
+
+  Serial.println();
+  Serial.println("Nyisd meg:");
+
+  Serial.print("http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
+
+  delay(500);
+
+  for (int i = 0; i < DEVICE_COUNT; i++) {
+    sendBind(i);
+    delay(350);
+  }
+
+  lastBindCycle = millis();
+  lastStatusCycle = millis();
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+  server.handleClient();
+
+  processUdpPackets();
+  handleTimeouts();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    connectWiFi();
+  }
+
+  if (
+    millis() - lastBindCycle >=
+    BIND_RETRY_MS
+  ) {
+    lastBindCycle = millis();
+
+    for (int i = 0; i < DEVICE_COUNT; i++) {
+      if (
+        !devices[i].bound &&
+        !devices[i].awaitingBind
+      ) {
+        sendBind(i);
+        delay(250);
+      }
+    }
+  }
+
+  if (
+    millis() - lastStatusCycle >=
+    STATUS_INTERVAL_MS
+  ) {
+    lastStatusCycle = millis();
+
+    for (int i = 0; i < DEVICE_COUNT; i++) {
+      if (
+        devices[i].bound &&
+        !devices[i].awaitingStatus
+      ) {
+        sendStatusRequest(i);
+        delay(150);
+      }
+    }
+  }
+
+  delay(2);
+}
